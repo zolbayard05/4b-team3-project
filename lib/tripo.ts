@@ -215,14 +215,24 @@ export async function submitMultiviewToModelTask(
 }
 
 /**
- * Submits a format-conversion task from an already-completed model task to
- * USDZ (rule 1: every model needs both .glb and .usdz; Tripo's image-to-model
- * task only produces the former — USDZ requires this second, separate async
- * task keyed off the first task's id).
+ * Submits a format-conversion task to USDZ (rule 1: every model needs both
+ * .glb and .usdz; neither Tripo's image-to-model task nor fal's trellis-2
+ * endpoint produces USDZ directly — this is always a second, separate async
+ * task).
+ *
+ * `input` accepts either a prior Tripo task_id (the original Tripo-sourced
+ * flow) or a plain publicly-fetchable URL to a GLB — confirmed at
+ * developers.tripo3d.ai/en/docs/models-convert ("input ... supports task_id
+ * or file_token" plus a direct URL to GLB/GLTF/FBX/OBJ/STL, max 150MB). The
+ * URL form is what lets a fal-generated GLB (lib/fal.ts) feed into this same
+ * conversion task — app/api/webhooks/fal/route.ts uploads the GLB to our own
+ * public `models` bucket first, then passes that URL here. Either way, the
+ * resulting task_id lands on the existing app/api/webhooks/tripo/route.ts
+ * webhook unchanged, matched via models.usdz_provider_job_id.
  */
-export async function submitUsdzConversionTask(sourceTaskId: string): Promise<{ taskId: string }> {
+export async function submitUsdzConversionTask(input: { taskId: string } | { url: string }): Promise<{ taskId: string }> {
   const data = await tripoFetch<{ task_id: string }>("/models/convert", {
-    input: sourceTaskId,
+    input: "taskId" in input ? input.taskId : input.url,
     format: "USDZ",
   });
   return { taskId: data.task_id };

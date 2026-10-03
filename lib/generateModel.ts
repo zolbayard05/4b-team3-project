@@ -4,6 +4,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { getR2Client, getUploadsBucket } from "@/lib/r2";
 import { submitImageToModelTask, submitMultiviewToModelTask, DEFAULT_FACE_LIMIT } from "@/lib/tripo";
+import { submitFalImageToModelTask } from "@/lib/fal";
 
 const SOURCE_URL_EXPIRY_SECONDS = 10 * 60;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -50,6 +51,34 @@ export async function submitTripoTaskForKeys(
     keys.right ? presignSourceUrl(keys.right) : Promise.resolve(undefined),
   ]);
   return submitMultiviewToModelTask({ front, left, back, right }, faceLimit);
+}
+
+/**
+ * fal's trellis-2 endpoint has no multiview input — only ever called for the
+ * single-photo (front-only) case; submitGeneration below never routes a
+ * multiview job here regardless of GENERATION_PROVIDER. `faceLimit` isn't
+ * accepted (fal has no equivalent param wired up yet, see lib/fal.ts) — kept
+ * as an unused parameter only so call sites that resubmit at a smaller
+ * budget (app/api/webhooks/tripo/route.ts's USDZ size-retry) can treat this
+ * and submitTripoTaskForKeys as interchangeable.
+ */
+export async function submitFalTaskForKeys(
+  keys: SourceImageKeys,
+  _faceLimit: number = DEFAULT_FACE_LIMIT,
+): Promise<{ taskId: string }> {
+  const frontUrl = await presignSourceUrl(keys.front);
+  return submitFalImageToModelTask(frontUrl);
+}
+
+export type GenerationProvider = "tripo" | "fal";
+
+/**
+ * GENERATION_PROVIDER picks the provider for new single-photo generations
+ * (multiview always stays on Tripo — see submitFalTaskForKeys). Unset or
+ * unrecognized values fail safe toward "tripo", the longer-proven path.
+ */
+export function getGenerationProvider(): GenerationProvider {
+  return process.env.GENERATION_PROVIDER === "fal" ? "fal" : "tripo";
 }
 
 export interface SubmitGenerationInput {
@@ -169,6 +198,11 @@ export async function submitGeneration(
     return { ok: false, status: 402, error: "Кредит хүрэлцэхгүй байна" };
   }
 
+  // Multiview (left/back/right present) always stays on Tripo — fal's
+  // trellis-2 endpoint has no multiview input (see submitFalTaskForKeys).
+  const hasExtraAngles = Boolean(leftResult.key || backResult.key || rightResult.key);
+  const provider: GenerationProvider = hasExtraAngles ? "tripo" : getGenerationProvider();
+
   const { data: model, error: insertError } = await admin
     .from("models")
     .insert({
@@ -178,7 +212,7 @@ export async function submitGeneration(
       source_image_key_back: backResult.key,
       source_image_key_right: rightResult.key,
       status: "pending",
-      provider: "tripo",
+      provider,
       idempotency_key: idempotencyKey,
       source_image_width: imageWidth,
       source_image_height: imageHeight,
@@ -209,17 +243,18 @@ export async function submitGeneration(
   }
 
   try {
-    const { taskId } = await submitTripoTaskForKeys({
+    const keys: SourceImageKeys = {
       front: sourceImageKey,
       left: leftResult.key,
       back: backResult.key,
       right: rightResult.key,
-    });
+    };
+    const { taskId } = provider === "fal" ? await submitFalTaskForKeys(keys) : await submitTripoTaskForKeys(keys);
     await admin.from("models").update({ status: "processing", provider_job_id: taskId }).eq("id", model.id);
   } catch (err) {
     await admin.rpc("refund_credit", {
       model_id: model.id,
-      failure_reason: err instanceof Error ? err.message : "Tripo submission failed",
+      failure_reason: err instanceof Error ? err.message : `${provider} submission failed`,
     });
     return { ok: false, status: 502, error: "Үүсгэлт эхлүүлэхэд алдаа гарлаа" };
   }

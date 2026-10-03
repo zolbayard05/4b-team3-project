@@ -6,7 +6,7 @@ app stores. See the build spec in project history for full scope; phases land in
 ## Stack
 
 Next.js 16 (App Router, TS strict) · Tailwind CSS v4 · Supabase (auth/DB/Realtime) ·
-Cloudflare R2 · Tripo (image→3D) · `<model-viewer>` · Stripe · Vercel.
+Cloudflare R2 · Tripo + fal.ai/TRELLIS.2 (image→3D) · `<model-viewer>` · Stripe · Vercel.
 
 ## Getting started
 
@@ -107,23 +107,53 @@ to another key, confirms `uploads` rejects an unauthenticated direct fetch, and 
 `NEXT_PUBLIC_MODELS_CDN_URL` is live) checks the `models` CORS policy against a real
 and a spoofed origin.
 
-## Generation pipeline (Tripo)
+## Generation pipeline (Tripo + fal.ai)
 
-`POST /api/generate` (rule 12) deducts a credit, inserts a `pending` models
-row, and submits an image-to-model task to Tripo — then returns 202
-immediately. `POST /api/webhooks/tripo` does everything else, driven entirely
-by Tripo's callbacks:
+`POST /api/generate` (rule 12/37) deducts a credit, inserts a `pending`
+models row, and submits an image-to-model job to a provider — then returns
+202 immediately. Two providers exist (`lib/generateModel.ts
+getGenerationProvider()`, `models.provider`):
 
-1. Image-to-model task completes → webhook fires → handler downloads the
+- **Tripo** — the original, default provider. Handles multiview jobs
+  (left/back/right photos) unconditionally, and single-photo jobs when
+  `GENERATION_PROVIDER` is unset/`"tripo"`.
+- **fal.ai (TRELLIS.2)** — `GENERATION_PROVIDER=fal`, single-photo only.
+  Runs Microsoft's open-weight TRELLIS.2 model as a hosted fal.ai endpoint
+  (`lib/fal.ts`) — no self-hosted GPU, lower cost and (per published
+  benchmarks) higher image-to-3D fidelity than Tripo's model.
+
+Neither provider's base generation step produces USDZ — rule 1 needs both
+formats, so **USDZ conversion always goes through Tripo's `/models/convert`
+task**, regardless of which provider generated the GLB:
+
+1. The GLB-generation job completes → provider-specific webhook fires
+   (`/api/webhooks/tripo` or `/api/webhooks/fal`) → handler downloads the
    result and re-uploads it to the `models` bucket as `{modelId}.glb`, then
    submits a **second**, separate Tripo task (`/models/convert` → `USDZ`) —
-   Tripo's image-to-model task only produces GLB; rule 1 needs both formats.
-2. That conversion task completes → webhook fires again → handler downloads,
+   fed either a Tripo `task_id` (Tripo-originated) or a public URL to the
+   just-uploaded GLB (fal-originated; `/models/convert` accepts either, see
+   `lib/tripo.ts submitUsdzConversionTask`).
+2. That conversion task completes → webhook fires on `/api/webhooks/tripo`
+   (always — it's a genuine Tripo task either way) → handler downloads,
    uploads `{modelId}.usdz`, and flips the row to `ready`.
 
-Both events land on the same `/api/webhooks/tripo` endpoint; `models.provider_job_id`
-/ `models.usdz_provider_job_id` is how an incoming `task_id` gets matched back
-to which stage it belongs to.
+Both of a Tripo-originated model's events land on `/api/webhooks/tripo`;
+`models.provider_job_id` / `models.usdz_provider_job_id` is how an incoming
+`task_id` gets matched back to which stage it belongs to. A fal-originated
+model's first event lands on `/api/webhooks/fal` instead (matched via
+`provider_job_id` + `provider='fal'`), and its second (USDZ) event still
+lands on `/api/webhooks/tripo` like any other Tripo task.
+
+**Required setup for fal.ai:**
+
+- `FAL_API_KEY` — fal.ai dashboard → Keys.
+- `NEXT_PUBLIC_APP_URL` — fal has a per-request `fal_webhook` query param
+  (unlike Tripo's console-configured webhook), built from this var in
+  `lib/fal.ts`. In local dev this means `localhost` isn't reachable from fal
+  either — same tunnel requirement as Tripo's webhook, below.
+- fal's webhook signature scheme (ED25519 + JWKS, `lib/fal.ts
+  verifyFalWebhookSignature`) needs no secret to configure — it's verified
+  against fal's own published public keys.
 
 **Required setup Tripo doesn't take as request parameters:**
 

@@ -13,7 +13,7 @@ import {
   MAX_REGEN_RETRIES,
   type TripoTask,
 } from "@/lib/tripo";
-import { submitTripoTaskForKeys } from "@/lib/generateModel";
+import { submitTripoTaskForKeys, submitFalTaskForKeys } from "@/lib/generateModel";
 import { compressGlb, validateGlb } from "@/lib/glbCompress";
 import { bakeGlbScale } from "@/lib/glbScale";
 import { bakeUsdzScale } from "@/lib/usdzScale";
@@ -283,15 +283,22 @@ export async function POST(request: Request) {
     );
 
     try {
-      const { taskId: newTaskId } = await submitTripoTaskForKeys(
-        {
-          front: model.source_image_key,
-          left: model.source_image_key_left,
-          back: model.source_image_key_back,
-          right: model.source_image_key_right,
-        },
-        nextFaceLimit,
-      );
+      // The USDZ stage is always a genuine Tripo conversion task regardless
+      // of which provider generated the GLB (see lib/tripo.ts
+      // submitUsdzConversionTask) — but an oversized result means the
+      // *geometry* has to be regenerated, and that must go back through
+      // whichever provider originally produced it (model.provider), not
+      // always Tripo, or a fal-sourced model would silently and incorrectly
+      // flip to Tripo-generated geometry on retry without models.provider
+      // ever reflecting that.
+      const keys = {
+        front: model.source_image_key,
+        left: model.source_image_key_left,
+        back: model.source_image_key_back,
+        right: model.source_image_key_right,
+      };
+      const { taskId: newTaskId } =
+        model.provider === "fal" ? await submitFalTaskForKeys(keys, nextFaceLimit) : await submitTripoTaskForKeys(keys, nextFaceLimit);
       const { data: updated } = await admin
         .from("models")
         .update({
@@ -391,7 +398,7 @@ export async function POST(request: Request) {
     }
 
     try {
-      const { taskId: usdzTaskId } = await submitUsdzConversionTask(task.task_id);
+      const { taskId: usdzTaskId } = await submitUsdzConversionTask({ taskId: task.task_id });
       await admin.from("models").update({ usdz_provider_job_id: usdzTaskId }).eq("id", model.id);
     } catch (err) {
       await admin.rpc("refund_credit", {

@@ -164,6 +164,32 @@ Numbered so they can be referenced from code comments (e.g. "see rule 30").
     watch that data for the technique quietly degrading on an unfamiliar
     object/material type rather than finding out from a user.
 
+## Multiple generation providers
+
+37. **`models.provider` can be `"tripo"` or `"fal"`.** `GENERATION_PROVIDER`
+    (lib/generateModel.ts `getGenerationProvider()`) picks the default for a
+    new single-photo generation; multiview (left/back/right present) always
+    forces `"tripo"` regardless of that setting, since fal's trellis-2
+    endpoint (lib/fal.ts) has no multiview input. Rule 12's "submit the job
+    to Tripo" should be read as "submit to the selected provider" — the
+    deduct-credit/insert-pending/submit/return-202 shape is identical either
+    way, shared by both in `submitGeneration` (lib/generateModel.ts).
+38. **USDZ conversion always goes through Tripo's `/models/convert` task,
+    regardless of which provider generated the GLB.** Neither provider
+    emits USDZ directly. A fal-sourced GLB is uploaded to our own public
+    `models` bucket first (app/api/webhooks/fal/route.ts), then that URL
+    (not a task_id) is passed to `submitUsdzConversionTask` — the resulting
+    Tripo task's completion lands on the existing
+    app/api/webhooks/tripo/route.ts webhook unchanged, matched via
+    `usdz_provider_job_id` same as a Tripo-originated model. Rules 13/16
+    (verify-then-reupload-then-ready ordering; idempotent on state
+    transition) apply identically to app/api/webhooks/fal/route.ts.
+39. **A size-budget retry on an oversized USDZ must resubmit through
+    `model.provider`, not always Tripo** — see the branch in
+    app/api/webhooks/tripo/route.ts's USDZ-stage handling. Getting this
+    wrong would silently regenerate a fal-sourced model's geometry via Tripo
+    on retry without `models.provider` ever reflecting that.
+
 ## Auth & authorization
 
 30. **`proxy.ts` is not an authorization boundary.** It refreshes the Supabase
